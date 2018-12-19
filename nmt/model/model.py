@@ -32,7 +32,8 @@ def transformer_encoder(inputs, params):
                                            params.hidden_size, dropout=params.dropout,
                                            mask=padding_mask)
 
-    outputs = tf.identity(current, name="encoder_outputs")
+    outputs = layers.layer_norm(current, name="encoder_outputs")
+
     return outputs
 
 
@@ -69,8 +70,10 @@ def transformer_decoder(encoder_outputs, source_lengths, inputs, params):
     return logits
 
 
-def transformer_decoder_for_inference(encoder_outputs, source_lengths, inputs, states, params):
+def transformer_decoder_for_inference(inputs, states, params):
     step = tf.shape(inputs)[1]
+    encoder_outputs= states["encoder_output"]
+    source_lengths = states["encoder_length"]
 
     with tf.variable_scope("target_embeddings"):
         word_embeddings = build_embeddings(params.target_vocabulary_size, params.model_dim)

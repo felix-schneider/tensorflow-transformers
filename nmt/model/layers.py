@@ -48,8 +48,7 @@ def layer_norm(x, epsilon=1e-6, name=None, reuse=None):
     :return:
     """
     n_filters = shape_list(x)[-1]
-    with tf.variable_scope(
-            name, default_name="layer_norm", values=[x], reuse=reuse):
+    with tf.variable_scope(name, default_name="layer_norm", values=[x], reuse=reuse):
         scale = tf.get_variable("layer_norm_scale", [n_filters], initializer=tf.ones_initializer())
         bias = tf.get_variable("layer_norm_bias", [n_filters], initializer=tf.zeros_initializer())
         mean = tf.reduce_mean(x, axis=[-1], keepdims=True)
@@ -64,7 +63,7 @@ def norm_residual_sublayer(inputs, outputs, dropout=0.0):
     return layer_norm(inputs + outputs)
 
 
-def mask_logits(logits, mask, mask_value=-1e9):
+def mask_logits(logits, mask, mask_value=-1e30):
     """
     Mask out some entries of logits, replacing them with (effectively) negative infinity.
     :param logits:
@@ -82,8 +81,9 @@ def scaled_dot_product_attention(queries, keys, values, dropout=0.0, mask=None):
     Calculate scaled dot product attention
     """
     scale_fac = tf.rsqrt(tf.cast(keys.shape.as_list()[-1], tf.float32))
+    queries *= scale_fac
     # (batch_size, <n_heads>, length_q, length_kv
-    logits = tf.matmul(queries, keys, transpose_b=True) * scale_fac
+    logits = tf.matmul(queries, keys, transpose_b=True)
     if mask is not None:
         if mask.shape.ndims == 3:  # mask is shape (batch_size, length_q, length_kv)
             mask = tf.expand_dims(mask, 1)  # allow broadcasting to heads
@@ -141,55 +141,54 @@ def feed_forward_net(inputs, hidden_size, dropout=0.0):
 
 def encoder_block(inputs, num_heads, num_units, hidden_size, dropout=0.0, mask=None):
     with tf.variable_scope("self_attention_layer"):
-        inputs = layer_norm(inputs)
-        attention_output = multi_head_attention(inputs, inputs, inputs,
+        attention_input = layer_norm(inputs)
+        attention_output = multi_head_attention(attention_input, attention_input, attention_input,
                                                 num_heads, num_units, dropout, mask)
         if dropout > 0:
             attention_output = tf.nn.dropout(attention_output, 1.0 - dropout)
         attention_output += inputs
 
     with tf.variable_scope("feed_forward_layer"):
-        attention_output = layer_norm(attention_output)
-        output = feed_forward_net(attention_output, hidden_size, dropout)
+        feed_forward_input = layer_norm(attention_output)
+        output = feed_forward_net(feed_forward_input, hidden_size, dropout)
         if dropout > 0:
             output = tf.nn.dropout(output, 1.0 - dropout)
         output += attention_output
-
-    output = layer_norm(output)
 
     return output
 
 
 def decoder_block(encoder_outputs, inputs, num_heads, num_units, hidden_size, dropout=0.0, self_attention_mask=None,
                   encoder_decoder_mask=None, cached_outputs=None):
-    if cached_outputs is None:
-        cached_outputs = inputs
 
     with tf.variable_scope("self_attention_layer"):
-        inputs = layer_norm(inputs)
-        attention_output = multi_head_attention(inputs, cached_outputs, cached_outputs,
-                                                num_heads, num_units, dropout, self_attention_mask)
+        attention_input_query = layer_norm(inputs, name="layer_norm")
+        if cached_outputs is None:
+            attention_input_key_value = attention_input_query
+        else:
+            attention_input_key_value = layer_norm(cached_outputs, name="layer_norm", reuse=True)
+        self_attention_output = multi_head_attention(attention_input_query, attention_input_key_value,
+                                                     attention_input_key_value, num_heads, num_units, dropout,
+                                                     self_attention_mask)
         if dropout > 0:
-            attention_output = tf.nn.dropout(attention_output, 1.0 - dropout)
-        attention_output += inputs
+            self_attention_output = tf.nn.dropout(self_attention_output, 1.0 - dropout)
+        self_attention_output += inputs
 
     with tf.variable_scope("encoder_decoder_attention_layer"):
-        x = layer_norm(attention_output)
-        attention_output = multi_head_attention(x, encoder_outputs, encoder_outputs,
-                                                num_heads, num_units, dropout, encoder_decoder_mask)
+        encoder_attention_inputs = layer_norm(self_attention_output)
+        encoder_attention_output = multi_head_attention(encoder_attention_inputs, encoder_outputs, encoder_outputs,
+                                                        num_heads, num_units, dropout, encoder_decoder_mask)
         if dropout > 0:
-            attention_output = tf.nn.dropout(attention_output, 1.0 - dropout)
-        attention_output += x
+            encoder_attention_output = tf.nn.dropout(encoder_attention_output, 1.0 - dropout)
+        encoder_attention_output += self_attention_output
 
     with tf.variable_scope("feed_forward_layer"):
-        attention_output = layer_norm(attention_output)
-        output = feed_forward_net(attention_output, hidden_size, dropout)
+        feed_forward_input = layer_norm(encoder_attention_output)
+        output = feed_forward_net(feed_forward_input, hidden_size, dropout)
 
         if dropout > 0:
             output = tf.nn.dropout(output, 1.0 - dropout)
-        output += attention_output
-
-    output = layer_norm(output)
+        output += encoder_attention_output
 
     return output
 

@@ -170,3 +170,5 @@ fabric.properties
 /test4.py
 /test2.py
 /test.py
+/evaluate_partition.py
+/preprocess.py

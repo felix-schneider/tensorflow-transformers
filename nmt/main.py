@@ -7,7 +7,7 @@ from tqdm import tqdm
 from nmt import model
 from nmt.beam_search import beam_search
 from nmt.bleu import compute_bleu, bleu_tokenize
-from nmt.data_reader import batching_scheme
+from nmt.util import batch_parallel_dataset
 
 import os
 import re
@@ -86,62 +86,46 @@ def build_dataset(source, target, vocabularies, params, shuffle_repeat=True):
     dataset = tf.data.Dataset.zip((build_input_pipeline(source, vocabularies[0], params, True),
                                    build_input_pipeline(target, vocabularies[1], params)))
 
-    scheme = batching_scheme(
-        params.batch_size,
-        params.max_example_length, 8, 1.1,
-        True,
-        # params.actual_devices
-    )
-
-    dataset = dataset.filter(lambda x, y: (x["length"] <= scheme["max_length"]) & (y["length"] <= scheme["max_length"]))
+    dataset = dataset.filter(lambda x, y: (x["length"] <= params.max_example_length) &
+                                          (y["length"] <= params.max_example_length))
 
     if shuffle_repeat:
         dataset = dataset.apply(tf.data.experimental.shuffle_and_repeat(params.shuffle_buffer_size))
 
-    dataset = dataset.apply(tf.data.experimental.bucket_by_sequence_length(
-        lambda x, y: y["length"] + 1,
-        scheme["boundaries"],
-        scheme["batch_sizes"],
+    dataset = dataset.apply(batch_parallel_dataset(
+        params.batch_size, "tokens", 1, 2,
         ({"indices": [None], "length": []},) * 2,
-        ({"indices": params.source_pad_id, "length": 0}, {"indices": params.target_pad_id, "length": 0})
+        ({"indices": params.source_pad_id, "length": 0}, {"indices": params.target_pad_id, "length": 0}),
+        lambda x: x["length"],
+        lambda x: x["length"]
     ))
 
     if shuffle_repeat:
-        dataset = dataset.shuffle(scheme["shuffle_queue_size"])
+        dataset = dataset.shuffle(50)
 
     dataset = dataset.prefetch(1)
 
     return dataset
 
 
-def build_encoder(source, params):
-    # with tf.control_dependencies([tf.print([tf.reduce_prod(tf.shape(inputs))])]):
-    return model.transformer_encoder(source, params)
-
-
-def build_decoder(encoder_outputs, source_lengths, inputs, params, states=None):
-    if states is None:
-        return model.transformer_decoder(encoder_outputs, source_lengths, inputs, params)
-    else:
-        return model.transformer_decoder_for_inference(encoder_outputs, source_lengths, inputs, states, params)
-
-
 def build_model(source, params, target=None):
-    encoder_outputs = build_encoder(source, params)
+    encoder_outputs = model.transformer_encoder(source, params)
     if target is None:  # if no labels are given, we must be in inference
         input_indices = source["indices"]
 
         def symbols_to_logits_fn(decoder_inputs, i, states):
-            tiled_encoder_outputs = tf.tile(encoder_outputs, [params.beam_size, 1, 1])
-            tiled_encoder_lengths = tf.tile(source["length"], [params.beam_size])
-            return build_decoder(tiled_encoder_outputs, tiled_encoder_lengths, decoder_inputs, params, states), states
+            return model.transformer_decoder_for_inference(decoder_inputs, states, params), states
 
         # TODO: should be agnostic to decoder architecture
         states = {"decoder_layer_{}".format(i): tf.zeros([tf.shape(encoder_outputs)[0], 0, params.model_dim])
                   for i in range(params.num_decoder_blocks)}
+        states["encoder_output"] = encoder_outputs
+        states["encoder_length"] = source["length"]
+
+        batch_size = tf.shape(input_indices)[0]
 
         beams, probs = beam_search(symbols_to_logits_fn,
-                                   tf.cast(tf.fill(tf.shape(input_indices)[:1], params.target_end_id), tf.int32),
+                                   params.target_end_id * tf.ones([batch_size], dtype=tf.int32),
                                    params.beam_size,
                                    tf.shape(input_indices)[1] + 50,
                                    params.target_vocabulary_size,
@@ -155,13 +139,12 @@ def build_model(source, params, target=None):
         decoder_inputs = target["indices"][:, :-1]
         decoder_inputs = tf.identity(decoder_inputs, name="decoder_inputs")
         decoder_inputs = {"indices": decoder_inputs, "length": target["length"]}
-        return build_decoder(encoder_outputs, source["length"], decoder_inputs, params)
+        return model.transformer_decoder(encoder_outputs, source["length"], decoder_inputs, params)
 
 
 def build_loss(logits, target, params):
     target, label_lengths = target["indices"], target["length"]
     target = target[:, 1:]
-    batch_size = tf.shape(logits)[0]
 
     one_hot_labels = tf.one_hot(target, params.target_vocabulary_size, dtype=tf.float32, name="one_hot_labels")
     smoothed_labels = tf.add(one_hot_labels * (1.0 - params.label_smoothing),
@@ -169,8 +152,6 @@ def build_loss(logits, target, params):
                              name="smoothed_labels")
     mask = tf.sequence_mask(label_lengths, dtype=tf.float32, name="sequence_weights")
     loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=smoothed_labels, logits=logits, name="raw_loss")
-    # loss = tf.distributions.kl_divergence(tf.distributions.Categorical(logits=tf.nn.log_softmax(logits)),
-    #                                       tf.distributions.Categorical(probs=tf.stop_gradient(smoothed_labels)))
     loss = tf.multiply(loss, mask, name="masked_loss")
     return loss
 
@@ -250,8 +231,7 @@ def train(params):
                     mean_loss = tf.reduce_sum(train_loss) / tf.cast(tf.reduce_sum(target["length"]), tf.float32)
                     train_op = optimizer.minimize(mean_loss, global_step, tf.trainable_variables("model"))
                     accumulate_op = zero_op = None
-                    tf.summary.scalar("loss", mean_loss)
-                    tf.summary.scalar("perplexity", tf.exp(mean_loss))
+
                 else:
                     # Accumulate gradients to simulate multi-GPU training
                     trainable_variables = tf.trainable_variables("model")
@@ -275,8 +255,10 @@ def train(params):
                         zero_op = tf.group([tf.assign(var, tf.zeros_like(var)) for var in gradient_accumulators.values()] +
                                            [tf.assign(loss_accumulator, 0.0), tf.assign(word_accumulator, 0)])
                     mean_loss = loss_accumulator / word_accumulator
-                    tf.summary.scalar("loss", mean_loss)
-                    tf.summary.scalar("perplexity", tf.exp(mean_loss))
+
+                perplexity = tf.exp(mean_loss)
+                tf.summary.scalar("loss", mean_loss)
+                tf.summary.scalar("perplexity", tf.exp(mean_loss))
 
             # with tf.name_scope("dev"), tf.device("/GPU:0" if params.using_gpu else "/CPU:0"):
             with tf.name_scope("dev"):
@@ -322,19 +304,19 @@ def train(params):
 
             with tqdm(total=total_training_steps, initial=step, unit="step", postfix="??") as pbar:
                 if params.accumulate_gradients == 1:
-                    ema_loss = None
+                    ema_perplexity = None
                     for step in range(step // params.accumulate_gradients + 1, params.training_steps + 1):
-                        _, summary_string, loss = session.run([train_op, summary_op, mean_loss])
+                        _, summary_string, ppl = session.run([train_op, summary_op, perplexity])
 
-                        if np.isnan(loss):
+                        if np.isnan(ppl):
                             raise ValueError("NaN loss encountered in step {}".format(step))
 
-                        if ema_loss is None:
-                            ema_loss = loss
+                        if ema_perplexity is None:
+                            ema_perplexity = ppl
                         else:
-                            ema_loss = 0.6 * ema_loss + 0.4 * loss
+                            ema_perplexity = 0.6 * ema_perplexity + 0.4 * ppl
 
-                        pbar.set_postfix_str("Loss: {:.1f}".format(ema_loss))
+                        pbar.set_postfix_str("PPL: {:.1f}".format(ema_perplexity))
                         pbar.update()
 
                         if step % params.log_interval == 0 or step < params.log_interval:
@@ -350,12 +332,12 @@ def train(params):
                             session.run([accumulate_op])
                             pbar.update()
 
-                        _, summary_string, loss, _ = session.run([train_op, summary_op, mean_loss, zero_op])
+                        _, summary_string, ppl, _ = session.run([train_op, summary_op, perplexity, zero_op])
 
-                        if np.isnan(loss):
+                        if np.isnan(ppl):
                             raise ValueError("NaN loss encountered in step {}".format(step))
 
-                        pbar.set_postfix_str("Loss: {:.1f}".format(loss))
+                        pbar.set_postfix_str("PPL: {:.1f}".format(ppl))
 
                         if step % params.log_interval == 0 or step < params.log_interval:
                             summary_writer.add_summary(summary_string, step)
@@ -410,13 +392,17 @@ def evaluate_dev_set(session, outputs_search, outputs_forced, loss, iterator, la
     bleu = compute_bleu([bleu_tokenize(ref) for ref in label_strings],
                         [bleu_tokenize(pred) for pred in predictions])
 
-    with open(params.test_output, "w") as fh:
+    output_dir = os.path.join(params.output_dir, params.model_name)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with open(os.path.join(output_dir, "beam_output"), "w") as fh:
         fh.writelines(p + "\n" for p in predictions)
 
-    with open(params.test_output + "2", "w") as fh:
+    with open(os.path.join(output_dir, "eval_output"), "w") as fh:
         fh.writelines(p + "\n" for p in forced_predictions)
 
-    with open("../verification.de", "w") as fh:
+    with open(os.path.join(output_dir, "verification_labels"), "w") as fh:
         fh.writelines(p + "\n" for p in label_strings)
 
     summaries = {
