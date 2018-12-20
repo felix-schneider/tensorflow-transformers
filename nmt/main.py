@@ -161,9 +161,6 @@ def build_optimizer(params):
     learning_rate = (params.model_dim ** -0.5) * tf.minimum(tf.rsqrt(step),
                                                             step * (params.warmup_steps ** -1.5))
 
-    # learning_rate *= 2.5
-    # learning_rate = 1.e-3
-
     tf.summary.scalar("learning rate", learning_rate)
     opt = tf.train.AdamOptimizer(learning_rate, params.beta1, params.beta2, params.adam_epsilon)
     return opt
@@ -416,8 +413,15 @@ def evaluate_dev_set(session, outputs_search, outputs_forced, loss, iterator, la
 def test(params):
     train_dir = os.path.join(params.train_dir, params.model_name)
 
-    with open(params.vocabulary_file) as fh:
-        lookup = [line.split(" ")[0] for line in fh]
+    with open(params.source_vocabulary_file) as fh:
+        source_lookup = [line.split(" ")[0] for line in fh]
+
+    source_lookup.extend(["<oov>", "<end>", "<pad>"])
+
+    with open(params.target_vocabulary_file) as fh:
+        target_lookup = [line.split(" ")[0] for line in fh]
+
+    target_lookup.extend(["<oov>", "<end>", "<pad>"])
 
     with tf.Graph().as_default():
         sess_config = tf.ConfigProto(allow_soft_placement=True)
@@ -446,47 +450,54 @@ def test(params):
             label_indices = labels["indices"]
             label_lengths = labels["length"]
 
-            predictions = []
-            forced_predictions = []
             label_strings = []
+            forced_predictions = []
+            predictions = []
             total_loss = 0.0
             total_words = 0
 
-            def assemble_string(indices):
+            def assemble_string(lookup, indices):
                 words = []
                 for index in indices:
                     if index >= len(lookup):
                         continue
+                    elif lookup[index] == "<end>":
+                        break
                     else:
                         words.append(lookup[index])
                 return bpe_re.sub("", " ".join(words))
 
-            with tqdm(total=params.test_samples, unit="words") as pbar:
+            with tqdm(total=params.development_samples, postfix="evaluation", unit="word") as pbar:
                 while True:
                     try:
-                        pred, pred2, lab, labl, loss = session.run([test_outputs, test_forced, label_indices, label_lengths, test_loss])
-                        predictions.extend(assemble_string(p) for p in pred)
-                        forced_predictions.extend(assemble_string(p) for p in np.argmax(pred2, -1))
-                        label_strings.extend(assemble_string(l) for l in lab)
-                        total_loss += np.sum(loss)
-                        n_words = np.sum(labl)
-                        total_words += n_words
-                        pbar.update(n_words)
+                        pred, pred2, lab, labl, lo = session.run(
+                            [test_outputs, test_forced, label_indices, label_lengths, test_loss])
                     except tf.errors.OutOfRangeError:
                         break
+                    predictions.extend(assemble_string(target_lookup, p[1:]) for p in pred)
+                    forced_predictions.extend(assemble_string(target_lookup, p) for p in np.argmax(pred2, -1))
+                    label_strings.extend(assemble_string(target_lookup, l[1:]) for l in lab)
+                    total_loss += np.sum(lo)
+                    n_words = np.sum(labl)
+                    total_words += n_words
+                    pbar.update(n_words)
 
-            mean_loss = total_loss / total_words
-            mean_perplexity = np.exp(mean_loss)
-            bleu = compute_bleu([bleu_tokenize(ref) for ref in label_strings],
-                                [bleu_tokenize(pred) for pred in predictions])
+    mean_loss = total_loss / total_words
+    mean_perplexity = np.exp(mean_loss)
+    bleu = compute_bleu([bleu_tokenize(ref) for ref in label_strings],
+                        [bleu_tokenize(pred) for pred in predictions])
 
-    with open(params.test_output, "w") as fh:
+    output_dir = os.path.join(params.output_dir, params.model_name)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with open(os.path.join(output_dir, "beam_output"), "w") as fh:
         fh.writelines(p + "\n" for p in predictions)
 
-    with open(params.test_output + "2", "w") as fh:
+    with open(os.path.join(output_dir, "eval_output"), "w") as fh:
         fh.writelines(p + "\n" for p in forced_predictions)
 
-    with open("../verification.en", "w") as fh:
+    with open(os.path.join(output_dir, "verification_labels"), "w") as fh:
         fh.writelines(p + "\n" for p in label_strings)
 
     print("Loss: {:.3f}".format(mean_loss))

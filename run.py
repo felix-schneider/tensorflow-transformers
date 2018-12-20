@@ -50,7 +50,7 @@ parser.add_argument("--num_decoder_blocks", type=int, default=6)
 parser.add_argument("--max_example_length", type=int, default=100)
 parser.add_argument("--label_smoothing", type=int, default=0.1)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--accumulate_gradients", type=int, default=8)  # maybe should be 8
+parser.add_argument("--accumulate_gradients", type=int, default=8)
 parser.add_argument("--test", action="store_true")
 parser.add_argument("--preprocess", action="store_true")
 

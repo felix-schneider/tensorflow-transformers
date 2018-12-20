@@ -64,6 +64,8 @@ def transformer_decoder(encoder_outputs, source_lengths, inputs, params):
                                            params.hidden_size, dropout=params.dropout, self_attention_mask=future_mask,
                                            encoder_decoder_mask=encoder_mask)
 
+    current = layers.layer_norm(current, name="decoder_outputs")
+
     batch_size = tf.shape(inputs)[0]
     logits = tf.matmul(tf.reshape(current, [-1, params.model_dim]), word_embeddings, transpose_b=True)
     logits = tf.reshape(logits, [batch_size, -1, params.target_vocabulary_size], name="logits")
@@ -96,6 +98,8 @@ def transformer_decoder_for_inference(inputs, states, params):
         previous_outputs = states[layer_name]
         previous_outputs = tf.concat([previous_outputs, current_output], 1)
         states[layer_name] = previous_outputs
+
+    current_output = layers.layer_norm(current_output, name="decoder_outputs")
 
     current_output = tf.squeeze(current_output, 1)
     logits = tf.matmul(current_output, word_embeddings, transpose_b=True, name="logits")
